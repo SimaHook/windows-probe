@@ -1,0 +1,89 @@
+name: probe5
+
+# ОДИН ФАЙЛ. Гипотеза: ABE не включается, потому что профиль создан в нестандартном
+# каталоге через --user-data-dir. Проверяем запуск Chrome БЕЗ этого флага, то есть
+# на обычном профиле %LOCALAPPDATA%\Google\Chrome\User Data — как у живого пользователя.
+# Куда: .github/workflows/probe5.yml   Запуск: Actions -> probe5 -> Run workflow
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      OSLABEL: ${{ matrix.os }}
+    steps:
+      - name: 1 - obychnyy profil
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          "=== ШАГ 1 ==="
+          $ud = "$env:LOCALAPPDATA\Google\Chrome\User Data"
+          "User Data путь      : $ud"
+          "существует ДО запуска: " + (Test-Path $ud)
+          $chrome = "$env:ProgramFiles\Google\Chrome\Application\chrome.exe"
+          "chrome              : " + (Get-Item $chrome).VersionInfo.ProductVersion
+          # запуск БЕЗ --user-data-dir: Chrome использует свой обычный профиль
+          $p = Start-Process -FilePath $chrome -PassThru -ErrorAction SilentlyContinue -ArgumentList @(
+            "--no-first-run", "--no-default-browser-check", "https://www.google.com/"
+          )
+          "запущен pid " + $p.Id
+          Start-Sleep -Seconds 45
+          "окон: " + @(Get-Process chrome -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 }).Count
+          Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 8
+
+      - name: 2 - chto v Local State
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          "=== ШАГ 2 ==="
+          $ud = "$env:LOCALAPPDATA\Google\Chrome\User Data"
+          $ls = "$ud\Local State"
+          "Local State есть: " + (Test-Path $ls)
+          if (Test-Path $ls) {
+            $c = (Get-Content $ls -Raw | ConvertFrom-Json).os_crypt
+            "os_crypt        : " + (($c.PSObject.Properties.Name) -join ", ")
+            "app_bound есть  : " + [bool]$c.app_bound_encrypted_key
+            foreach ($pp in $c.PSObject.Properties) {
+              $r = [Convert]::FromBase64String($pp.Value)
+              "   {0,-26} {1,5} Б  '{2}'" -f $pp.Name, $r.Length, [Text.Encoding]::ASCII.GetString($r[0..[Math]::Min(3,$r.Length-1)])
+            }
+            if ($c.app_bound_encrypted_key) {
+              $r = [Convert]::FromBase64String($c.app_bound_encrypted_key)
+              "   флаг после APPB: " + $r[4]
+            }
+          }
+          foreach ($rel in @("Default\Network\Cookies", "Default\Login Data", "Default\Web Data")) {
+            $p = Join-Path $ud $rel
+            if (-not (Test-Path $p)) { "{0} : нет файла" -f $rel; continue }
+            $ok = $false
+            for ($t = 1; $t -le 5 -and -not $ok; $t++) {
+              try {
+                $b = [IO.File]::ReadAllBytes($p)
+                $line = "{0} : {1} Б |" -f $rel, $b.Length
+                foreach ($tag in @("v10", "v11", "v20")) {
+                  $pat = [Text.Encoding]::ASCII.GetBytes($tag); $n = 0
+                  for ($i = 0; $i -le $b.Length - 3; $i++) {
+                    if ($b[$i] -eq $pat[0] -and $b[$i+1] -eq $pat[1] -and $b[$i+2] -eq $pat[2]) { $n++ }
+                  }
+                  $line = $line + " " + $tag + "=" + $n
+                }
+                $line
+                $ok = $true
+              } catch {
+                "попытка $t : файл занят, ждём"
+                Start-Sleep -Seconds 5
+              }
+            }
+          }
