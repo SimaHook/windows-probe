@@ -1,9 +1,8 @@
-name: windows-probe
+name: probe
 
-# КОРОТКАЯ ВЕРСИЯ. Нужно: (1) загрузить в репозиторий файл windows-kit.zip,
-# (2) создать этот файл по пути .github/workflows/windows-probe.yml и вставить сюда весь текст.
-# Затем: вкладка Actions -> windows-probe -> Run workflow.
-# Бесплатно для публичных репозиториев, карта не нужна.
+# ЕДИНСТВЕННЫЙ ФАЙЛ. Ничего загружать не нужно, зависимостей нет.
+# Куда: .github/workflows/windows-probe.yml (заменить содержимое этого файла).
+# Запуск: Actions -> probe -> Run workflow.
 
 on:
   workflow_dispatch:
@@ -14,42 +13,79 @@ jobs:
       fail-fast: false
       matrix:
         os: [windows-2022, windows-2025]
-    name: probe-${{ matrix.os }}
+    name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    timeout-minutes: 20
+    env:
+      OSLABEL: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Windows, Chrome, сессия
+      - name: 1 - chrome headless
         shell: pwsh
         run: |
-          Get-ComputerInfo -Property WindowsProductName, WindowsVersion, OsBuildNumber | Format-List | Out-String
-          "label: ${{ matrix.os }} | runner: $env:RUNNER_OS / $env:RUNNER_ARCH"
-          "session id процесса: " + (Get-Process -Id $PID).SessionId
-          $c = "$env:ProgramFiles\Google\Chrome\Application\chrome.exe"
-          if (Test-Path $c) { "installed Chrome: " + (Get-Item $c).VersionInfo.ProductVersion } else { "installed Chrome: нет" }
+          $prof = "$env:RUNNER_TEMP\prof"
+          Remove-Item -Recurse -Force $prof -ErrorAction SilentlyContinue
+          $chrome = "$env:ProgramFiles\Google\Chrome\Application\chrome.exe"
+          if (-not (Test-Path $chrome)) {
+            $z = "$env:RUNNER_TEMP\c.zip"
+            Invoke-WebRequest "https://storage.googleapis.com/chrome-for-testing-public/157.0.8103.38/win64/chrome-win64.zip" -OutFile $z
+            Expand-Archive $z "$env:RUNNER_TEMP\cft" -Force
+            $chrome = "$env:RUNNER_TEMP\cft\chrome-win64\chrome.exe"
+          }
+          "OS      : $env:OSLABEL / " + [Environment]::OSVersion.VersionString
+          "chrome  : " + (Get-Item $chrome).VersionInfo.ProductVersion
+          "session : " + (Get-Process -Id $PID).SessionId
+          & $chrome --headless=new --no-sandbox --disable-gpu --no-first-run "--user-data-dir=$prof" --virtual-time-budget=4000 --dump-dom "https://www.google.com/" | Out-Null
+          Start-Sleep -Seconds 3
+          Get-Process chrome -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$env:RUNNER_TEMP*" } | Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 2
 
-      - name: Распаковать набор
-        shell: pwsh
-        run: |
-          $kit = "$env:RUNNER_TEMP\kit"
-          Expand-Archive -Path "$env:GITHUB_WORKSPACE\windows-kit.zip" -DestinationPath $kit -Force
-          Get-ChildItem $kit | Format-Table Name, Length | Out-String
-          .\kit\gocrypt.exe -dpapi-selftest
-        working-directory: ${{ runner.temp }}
-
-      - name: Прогон
-        shell: pwsh
-        run: |
-          & "$env:RUNNER_TEMP\kit\ci_probe.ps1" -UseInstalledChrome -GoCrypt "$env:RUNNER_TEMP\kit\gocrypt.exe"
-
-      - name: Артефакт Local State и БД
+      - name: 2 - local state i dpapi
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: profile-${{ matrix.os }}
-          path: |
-            ${{ runner.temp }}/abe-probe/profile/Local State
-            ${{ runner.temp }}/abe-probe/profile/Default/Cookies
-            ${{ runner.temp }}/abe-probe/profile/Default/Login Data
-          if-no-files-found: warn
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Security
+          $ls = "$env:RUNNER_TEMP\prof\Local State"
+          if (-not (Test-Path $ls)) { Write-Host "::error::Local State не создан, Chrome не стартовал"; exit 1 }
+          $c = (Get-Content $ls -Raw | ConvertFrom-Json).os_crypt
+          "поля os_crypt: " + (($c.PSObject.Properties.Name) -join ", ")
+          foreach ($p in $c.PSObject.Properties) {
+            $r = [Convert]::FromBase64String($p.Value)
+            "  {0,-24} {1,5} Б  '{2}'" -f $p.Name, $r.Length, [Text.Encoding]::ASCII.GetString($r[0..3])
+          }
+          foreach ($n in @("encrypted_key", "app_bound_encrypted_key")) {
+            $v = $c.$n
+            if (-not $v) { "{0} : НЕТ в профиле" -f $n; continue }
+            $r = [Convert]::FromBase64String($v)
+            $off = 5
+            if ($n -eq "app_bound_encrypted_key") { $off = 4 }
+            try {
+              $k = [Security.Cryptography.ProtectedData]::Unprotect([byte[]]$r[$off..($r.Length-1)], $null, 'CurrentUser')
+              $hex = (([BitConverter]::ToString($k) -replace '-','').ToLower())
+              "{0} : РАСШИФРОВАЛСЯ, {1} бит, {2}" -f $n, ($k.Length*8), $hex
+            } catch {
+              "{0} : ОШИБКА DPAPI -> {1}" -f $n, $_.Exception.Message
+            }
+          }
+
+      - name: 3 - tegi v baze
+        if: always()
+        shell: pwsh
+        run: |
+          # Cookies у Chrome 96+ лежит в Default\Network\Cookies, у старых — в Default\Cookies,
+          # поэтому проверяем оба места
+          $base = "$env:RUNNER_TEMP\prof\Default"
+          foreach ($rel in @("Network\Cookies", "Cookies", "Login Data")) {
+            $p = Join-Path $base $rel
+            if (-not (Test-Path $p)) { "{0} : нет файла" -f $rel; continue }
+            $b = [IO.File]::ReadAllBytes($p)
+            $line = "{0} : {1} Б |" -f $rel, $b.Length
+            foreach ($t in @("v10", "v11", "v20")) {
+              $pat = [Text.Encoding]::ASCII.GetBytes($t)
+              $n = 0
+              for ($i = 0; $i -le $b.Length - 3; $i++) {
+                if ($b[$i] -eq $pat[0] -and $b[$i+1] -eq $pat[1] -and $b[$i+2] -eq $pat[2]) { $n++ }
+              }
+              $line = $line + " " + $t + "=" + $n
+            }
+            $line
+          }
