@@ -1,0 +1,55 @@
+name: windows-probe
+
+# КОРОТКАЯ ВЕРСИЯ. Нужно: (1) загрузить в репозиторий файл windows-kit.zip,
+# (2) создать этот файл по пути .github/workflows/windows-probe.yml и вставить сюда весь текст.
+# Затем: вкладка Actions -> windows-probe -> Run workflow.
+# Бесплатно для публичных репозиториев, карта не нужна.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    name: probe-${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Windows, Chrome, сессия
+        shell: pwsh
+        run: |
+          Get-ComputerInfo -Property WindowsProductName, WindowsVersion, OsBuildNumber | Format-List | Out-String
+          "label: ${{ matrix.os }} | runner: $env:RUNNER_OS / $env:RUNNER_ARCH"
+          "session id процесса: " + (Get-Process -Id $PID).SessionId
+          $c = "$env:ProgramFiles\Google\Chrome\Application\chrome.exe"
+          if (Test-Path $c) { "installed Chrome: " + (Get-Item $c).VersionInfo.ProductVersion } else { "installed Chrome: нет" }
+
+      - name: Распаковать набор
+        shell: pwsh
+        run: |
+          $kit = "$env:RUNNER_TEMP\kit"
+          Expand-Archive -Path "$env:GITHUB_WORKSPACE\windows-kit.zip" -DestinationPath $kit -Force
+          Get-ChildItem $kit | Format-Table Name, Length | Out-String
+          .\kit\gocrypt.exe -dpapi-selftest
+        working-directory: ${{ runner.temp }}
+
+      - name: Прогон
+        shell: pwsh
+        run: |
+          & "$env:RUNNER_TEMP\kit\ci_probe.ps1" -UseInstalledChrome -GoCrypt "$env:RUNNER_TEMP\kit\gocrypt.exe"
+
+      - name: Артефакт Local State и БД
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: profile-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/abe-probe/profile/Local State
+            ${{ runner.temp }}/abe-probe/profile/Default/Cookies
+            ${{ runner.temp }}/abe-probe/profile/Default/Login Data
+          if-no-files-found: warn
