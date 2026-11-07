@@ -1,0 +1,140 @@
+name: probe3
+
+# ОДИН ФАЙЛ. Версия, которая НЕ МОЖЕТ УПАСТЬ: каждый шаг обёрнут в try/catch
+# и стоит continue-on-error, поэтому job всегда зелёный, а все ошибки видны текстом в логе.
+# Куда: .github/workflows/probe3.yml   Запуск: Actions -> probe3 -> Run workflow
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      OSLABEL: ${{ matrix.os }}
+    steps:
+      - name: 1 - okruzhenie
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          "=== ШАГ 1 ==="
+          try {
+            "OS        : $env:OSLABEL / " + [Environment]::OSVersion.VersionString
+            "session   : " + (Get-Process -Id $PID).SessionId
+            "user      : " + [Environment]::UserName
+            $chrome = "$env:ProgramFiles\Google\Chrome\Application\chrome.exe"
+            "chrome ap : " + (Test-Path $chrome)
+            if (Test-Path $chrome) { "chrome ver: " + (Get-Item $chrome).VersionInfo.ProductVersion }
+            "---- службы ----"
+            Get-Service -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -match 'chrome|elevation' } |
+              Select-Object Name, Status, StartType | Format-Table -AutoSize | Out-String
+            "---- файлы рядом ----"
+            if (Test-Path $chrome) {
+              Get-ChildItem (Split-Path $chrome) -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -match 'elevation|chrome_proxy' } |
+                Select-Object Name, Length | Format-Table -AutoSize | Out-String
+            }
+            "---- реестр ----"
+            foreach ($k in @("HKLM:\SOFTWARE\Google\Chrome",
+                             "HKLM:\SOFTWARE\WOW6432Node\Google\Chrome",
+                             "HKLM:\SYSTEM\CurrentControlSet\Services")) {
+              if (Test-Path $k) { "есть: $k" } else { "нет : $k" }
+            }
+          } catch {
+            "ОШИБКА в шаге 1: " + $_.Exception.Message
+            "строка: " + $_.InvocationInfo.ScriptLineNumber + " -> " + $_.InvocationInfo.Line
+          } finally {
+            "=== шаг 1 завершён ==="
+          }
+
+      - name: 2 - headless
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          "=== ШАГ 2 ==="
+          try {
+            $chrome = "$env:ProgramFiles\Google\Chrome\Application\chrome.exe"
+            $prof = "$env:RUNNER_TEMP\p_headless"
+            Remove-Item -Recurse -Force $prof -ErrorAction SilentlyContinue
+            & $chrome --headless=new --no-sandbox --disable-gpu --no-first-run "--user-data-dir=$prof" --virtual-time-budget=4000 --dump-dom "https://www.google.com/" 2>&1 | Out-Null
+            "chrome exit code: $LASTEXITCODE"
+            Start-Sleep -Seconds 3
+            Get-Process chrome -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$env:RUNNER_TEMP*" } | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+            $ls = "$prof\Local State"
+            "Local State есть: " + (Test-Path $ls)
+            if (Test-Path $ls) {
+              $c = (Get-Content $ls -Raw | ConvertFrom-Json).os_crypt
+              "headless os_crypt: " + (($c.PSObject.Properties.Name) -join ", ")
+              "app_bound есть   : " + [bool]$c.app_bound_encrypted_key
+            }
+          } catch {
+            "ОШИБКА в шаге 2: " + $_.Exception.Message
+            "строка: " + $_.InvocationInfo.ScriptLineNumber + " -> " + $_.InvocationInfo.Line
+          } finally {
+            "=== шаг 2 завершён ==="
+          }
+
+      - name: 3 - obychnyy zapusk
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          "=== ШАГ 3 ==="
+          try {
+            $chrome = "$env:ProgramFiles\Google\Chrome\Application\chrome.exe"
+            $prof = "$env:RUNNER_TEMP\p_headful"
+            Remove-Item -Recurse -Force $prof -ErrorAction SilentlyContinue
+            $p = Start-Process -FilePath $chrome -PassThru -ErrorAction Stop -ArgumentList @(
+              "--user-data-dir=$prof", "--no-first-run", "--no-default-browser-check",
+              "--disable-gpu", "https://www.google.com/"
+            )
+            "headful запущен, pid " + $p.Id
+            Start-Sleep -Seconds 15
+            "процесс жив: " + (-not $p.HasExited)
+            "окон (MainWindowHandle != 0): " + @(Get-Process chrome -ErrorAction SilentlyContinue |
+              Where-Object { $_.MainWindowHandle -ne 0 }).Count
+            Get-Process chrome -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$env:RUNNER_TEMP*" } | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 3
+            $ls = "$prof\Local State"
+            "Local State есть: " + (Test-Path $ls)
+            if (Test-Path $ls) {
+              $c = (Get-Content $ls -Raw | ConvertFrom-Json).os_crypt
+              "headful os_crypt : " + (($c.PSObject.Properties.Name) -join ", ")
+              "app_bound есть   : " + [bool]$c.app_bound_encrypted_key
+              foreach ($pp in $c.PSObject.Properties) {
+                $r = [Convert]::FromBase64String($pp.Value)
+                "   {0,-24} {1,5} Б" -f $pp.Name, $r.Length
+              }
+            }
+            $ck = "$prof\Default\Network\Cookies"
+            "Network\Cookies есть: " + (Test-Path $ck)
+            if (Test-Path $ck) {
+              $b = [IO.File]::ReadAllBytes($ck)
+              $line = "размер $($b.Length) Б |"
+              foreach ($t in @("v10", "v20")) {
+                $pat = [Text.Encoding]::ASCII.GetBytes($t); $n = 0
+                for ($i = 0; $i -le $b.Length - 3; $i++) {
+                  if ($b[$i] -eq $pat[0] -and $b[$i+1] -eq $pat[1] -and $b[$i+2] -eq $pat[2]) { $n++ }
+                }
+                $line = $line + " " + $t + "=" + $n
+              }
+              $line
+            }
+          } catch {
+            "ОШИБКА в шаге 3: " + $_.Exception.Message
+            "строка: " + $_.InvocationInfo.ScriptLineNumber + " -> " + $_.InvocationInfo.Line
+          } finally {
+            "=== шаг 3 завершён ==="
+          }
