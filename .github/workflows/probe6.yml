@@ -1,0 +1,117 @@
+name: probe6
+
+# ОДИН ФАЙЛ. ABE найден: на обычном профиле есть app_bound_encrypted_key (644 Б, APPB, флаг 1),
+# куки v20. Теперь фиксируем «до/после» на живых данных:
+#   1) оба ключа: encrypted_key (v10) и app_bound_encrypted_key (v20) — DPAPI и точный текст отказа;
+#   2) байты одного v20-блоба: тег 3 + nonce 12 + ... + tag 16;
+#   3) сколько всего v20 в Cookies / Web Data.
+# Куда: .github/workflows/probe6.yml   Запуск: Actions -> probe6 -> Run workflow
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      OSLABEL: ${{ matrix.os }}
+    steps:
+      - name: 1 - profili i zapusk
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          "=== ШАГ 1 ==="
+          $chrome = "$env:ProgramFiles\Google\Chrome\Application\chrome.exe"
+          "chrome : " + (Get-Item $chrome).VersionInfo.ProductVersion
+          # обычный профиль (без --user-data-dir) — именно на нём включается ABE
+          $p = Start-Process -FilePath $chrome -PassThru -ErrorAction SilentlyContinue -ArgumentList @(
+            "--no-first-run", "--no-default-browser-check", "https://www.google.com/", "https://example.com/"
+          )
+          "pid " + $p.Id
+          Start-Sleep -Seconds 40
+          Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 8
+          "процессов chrome осталось: " + @(Get-Process chrome -ErrorAction SilentlyContinue).Count
+
+      - name: 2 - klyuchi i DPAPI
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Add-Type -AssemblyName System.Security
+          "=== ШАГ 2 ==="
+          $ls = "$env:LOCALAPPDATA\Google\Chrome\User Data\Local State"
+          $c = (Get-Content $ls -Raw | ConvertFrom-Json).os_crypt
+          "os_crypt: " + (($c.PSObject.Properties.Name) -join ", ")
+          "--------------------------------------------------------"
+          "1) encrypted_key (схема v10, старый путь)"
+          $r = [Convert]::FromBase64String($c.encrypted_key)
+          "   блоб: $($r.Length) Б, префикс 'DPAPI'"
+          try {
+            $k = [Security.Cryptography.ProtectedData]::Unprotect([byte[]]$r[5..($r.Length-1)], $null, 'CurrentUser')
+            "   DPAPI пользователя -> КЛЮЧ $($k.Length*8) бит: " + (([BitConverter]::ToString($k) -replace '-','').ToLower())
+            "   => этим ключом расшифровываются строки v10"
+          } catch { "   DPAPI -> ОШИБКА: " + $_.Exception.Message }
+          "--------------------------------------------------------"
+          "2) app_bound_encrypted_key (схема v20, App-Bound Encryption)"
+          $a = [Convert]::FromBase64String($c.app_bound_encrypted_key)
+          "   блоб: $($a.Length) Б, префикс '" + [Text.Encoding]::ASCII.GetString($a[0..3]) + "'"
+          "   флаг (4 байта LE): " + [BitConverter]::ToUInt32($a, 4)
+          "   первые 32 байта после префикса: " + (([BitConverter]::ToString($a[4..35]) -replace '-','').toLower())
+          try {
+            $k2 = [Security.Cryptography.ProtectedData]::Unprotect([byte[]]$a[4..($a.Length-1)], $null, 'CurrentUser')
+            "   DPAPI пользователя -> КЛЮЧ $($k2.Length) Б: " + (([BitConverter]::ToString($k2) -replace '-','').toLower())
+            "   (неожиданно: значит внешний слой всё-таки открылся)"
+          } catch {
+            "   DPAPI пользователя -> ОТКАЗ: " + $_.Exception.Message
+            "   => внешний слой запечатан ключом службы GoogleChromeElevationService (SYSTEM),"
+            "      и выдаётся только процессу, который служба признала подписанным chrome.exe"
+          }
+
+      - name: 3 - bayty v20 v baze
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          "=== ШАГ 3 ==="
+          $ud = "$env:LOCALAPPDATA\Google\Chrome\User Data\Default"
+          foreach ($rel in @("Network\Cookies", "Web Data", "Login Data")) {
+            $p = Join-Path $ud $rel
+            if (-not (Test-Path $p)) { "{0} : нет файла" -f $rel; continue }
+            $ok = $false
+            for ($t = 1; $t -le 5 -and -not $ok; $t++) {
+              try {
+                $b = [IO.File]::ReadAllBytes($p); $ok = $true
+              } catch { Start-Sleep -Seconds 5 }
+            }
+            if (-not $ok) { "{0} : занято, пропуск" -f $rel; continue }
+            "{0} : {1} Б" -f $rel, $b.Length
+            foreach ($tag in @("v10", "v20")) {
+              $pat = [Text.Encoding]::ASCII.GetBytes($tag); $n = 0; $first = -1
+              for ($i = 0; $i -le $b.Length - 3; $i++) {
+                if ($b[$i] -eq $pat[0] -and $b[$i+1] -eq $pat[1] -and $b[$i+2] -eq $pat[2]) {
+                  if ($first -lt 0) { $first = $i }
+                  $n++
+                }
+              }
+              if ($n -eq 0) { "   {0}: нет" -f $tag; continue }
+              "   {0}: {1} шт., первый по смещению {2}" -f $tag, $n, $first
+              if ($tag -eq "v20" -and $first -ge 0) {
+                $end = [Math]::Min($first + 47, $b.Length - 1)
+                $hex = ([BitConverter]::ToString($b[$first..$end]) -replace '-','').toLower()
+                "   тег + nonce(12) + начало шифртекста:"
+                "     " + $hex
+                "     ^^ 763230 = 'v20' | далее 24 hex-символа = nonce 12 Б | остальное = шифртекст AES-256-GCM"
+                "     последние 16 байт блоба — тег аутентификации, поэтому длина = 3 + 12 + len(pt) + 16"
+              }
+            }
+          }
