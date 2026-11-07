@@ -1,0 +1,107 @@
+name: probe2
+
+# ОДИН ФАЙЛ. Задача: понять, почему на стенде не включился ABE
+# (Chrome 156, куки v10, app_bound_encrypted_key отсутствует).
+# 1) есть ли в образе служба GoogleChromeElevationService и elevation_service.exe;
+# 2) появляется ли ABE-ключ при ОБЫЧНОМ (не headless) запуске Chrome;
+# 3) что в Local State в обоих случаях.
+# Куда: .github/workflows/probe2.yml   Запуск: Actions -> probe2 -> Run workflow
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      OSLABEL: ${{ matrix.os }}
+    steps:
+      - name: 1 - chrome i sluzhba
+        shell: pwsh
+        run: |
+          $chrome = "$env:ProgramFiles\Google\Chrome\Application\chrome.exe"
+          "OS        : $env:OSLABEL / " + [Environment]::OSVersion.VersionString
+          "session   : " + (Get-Process -Id $PID).SessionId
+          if (-not (Test-Path $chrome)) { Write-Host "::error::Chrome не найден"; exit 1 }
+          "chrome    : " + (Get-Item $chrome).VersionInfo.ProductVersion
+          "path      : $chrome"
+          "---- службы со словом chrome ----"
+          Get-Service | Where-Object { $_.Name -like "*chrome*" -or $_.DisplayName -like "*chrome*" } |
+            Select-Object Name, Status, StartType | Format-Table -AutoSize | Out-String
+          "---- файлы рядом с chrome.exe ----"
+          Get-ChildItem (Split-Path $chrome) -File | Where-Object { $_.Name -like "*elevation*" -or $_.Name -like "*chrome_proxy*" } |
+            Select-Object Name, Length | Format-Table -AutoSize | Out-String
+          "---- реестр: ключи ABE ----"
+          foreach ($k in @("HKLM:\SOFTWARE\Google\Chrome\NativeMessagingHosts",
+                           "HKLM:\SOFTWARE\WOW6432Node\Google\Chrome",
+                           "HKLM:\SOFTWARE\Google\Update\Clients")) {
+            if (Test-Path $k) { "  есть: $k" } else { "  нет : $k" }
+          }
+          $svc = Get-CimInstance Win32_Service -Filter "Name like '%Elevation%'" -ErrorAction SilentlyContinue
+          if ($svc) { $svc | Select-Object Name, State, StartMode, PathName | Format-List | Out-String }
+          else { "служба с Elevation в имени: НЕ найдена" }
+
+      - name: 2 - headless profil
+        if: always()
+        shell: pwsh
+        run: |
+          $chrome = "$env:ProgramFiles\Google\Chrome\Application\chrome.exe"
+          $prof = "$env:RUNNER_TEMP\p_headless"
+          Remove-Item -Recurse -Force $prof -ErrorAction SilentlyContinue
+          & $chrome --headless=new --no-sandbox --disable-gpu --no-first-run "--user-data-dir=$prof" --virtual-time-budget=4000 --dump-dom "https://www.google.com/" | Out-Null
+          Start-Sleep -Seconds 3
+          Get-Process chrome -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$env:RUNNER_TEMP*" } | Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 2
+          $ls = "$prof\Local State"
+          if (Test-Path $ls) {
+            $c = (Get-Content $ls -Raw | ConvertFrom-Json).os_crypt
+            "headless os_crypt: " + (($c.PSObject.Properties.Name) -join ", ")
+            "   app_bound есть: " + [bool]$c.app_bound_encrypted_key
+          } else { "headless: Local State не создан" }
+
+      - name: 3 - obychnyy zapusk
+        if: always()
+        shell: pwsh
+        run: |
+          $chrome = "$env:ProgramFiles\Google\Chrome\Application\chrome.exe"
+          $prof = "$env:RUNNER_TEMP\p_headful"
+          Remove-Item -Recurse -Force $prof -ErrorAction SilentlyContinue
+          $args = @("--user-data-dir=$prof", "--no-first-run", "--no-default-browser-check",
+                    "--disable-gpu", "https://www.google.com/")
+          $p = Start-Process -FilePath $chrome -ArgumentList $args -PassThru
+          "запущен headful Chrome, pid " + $p.Id
+          Start-Sleep -Seconds 15
+          $alive = -not $p.HasExited
+          "процесс жив через 15 с: $alive"
+          "окон у процесса: " + @(Get-Process chrome -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 }).Count
+          Get-Process chrome -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$env:RUNNER_TEMP*" } | Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 3
+          $ls = "$prof\Local State"
+          if (Test-Path $ls) {
+            $c = (Get-Content $ls -Raw | ConvertFrom-Json).os_crypt
+            "headful os_crypt: " + (($c.PSObject.Properties.Name) -join ", ")
+            "   app_bound есть: " + [bool]$c.app_bound_encrypted_key
+            foreach ($pp in $c.PSObject.Properties) {
+              $r = [Convert]::FromBase64String($pp.Value)
+              "   {0,-24} {1,5} Б" -f $pp.Name, $r.Length
+            }
+          } else { "headful: Local State не создан" }
+          $cookies = "$prof\Default\Network\Cookies"
+          if (Test-Path $cookies) {
+            $b = [IO.File]::ReadAllBytes($cookies)
+            $line = "headful Network\Cookies : $($b.Length) Б |"
+            foreach ($t in @("v10", "v20")) {
+              $pat = [Text.Encoding]::ASCII.GetBytes($t); $n = 0
+              for ($i = 0; $i -le $b.Length - 3; $i++) {
+                if ($b[$i] -eq $pat[0] -and $b[$i+1] -eq $pat[1] -and $b[$i+2] -eq $pat[2]) { $n++ }
+              }
+              $line = $line + " " + $t + "=" + $n
+            }
+            $line
+          } else { "headful: Network\Cookies нет" }
